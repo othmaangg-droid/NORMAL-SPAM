@@ -1,4 +1,4 @@
-# main.py - النسخة الكاملة مع مسار /stop
+# main.py - النسخة مع إعادة تشغيل تلقائية للحسابات
 
 from flask import Flask, request, jsonify
 import threading
@@ -13,6 +13,7 @@ import socket
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 import urllib3
+import psutil
 
 # استيراد الدوال من الملفات الأخرى
 from protobuf_decoder.protobuf_decoder import Parser
@@ -51,6 +52,11 @@ account_queue_lock = threading.Lock()
 
 ACCOUNTS = []
 
+# ============ متغيرات لإعادة التشغيل ============
+accounts_restart_flag = False
+last_restart_time = datetime.now()
+accounts_status = {}  # لتتبع حالة كل حساب
+
 # ============ دوال تحميل الحسابات ============
 def load_accounts_from_file(filename="accs.json"):
     accounts = []
@@ -73,6 +79,124 @@ def load_accounts_from_file(filename="accs.json"):
     except Exception as e:
         print(f"❌ Error reading file: {e}")
     return accounts
+
+# ============ دوال إعادة تشغيل الحسابات ============
+def check_and_restart_accounts():
+    """فحص وإعادة تشغيل الحسابات الميتة"""
+    global last_restart_time
+    
+    with connected_clients_lock:
+        current_accounts = list(connected_clients.keys())
+    
+    dead_accounts = []
+    
+    # فحص الحسابات المتصلة
+    with connected_clients_lock:
+        for account_id, client in list(connected_clients.items()):
+            try:
+                # فحص إذا كان الحساب لا يزال متصلاً
+                if not hasattr(client, 'CliEnts2') or client.CliEnts2 is None:
+                    dead_accounts.append(account_id)
+                elif hasattr(client, 'connection_active') and not client.connection_active:
+                    dead_accounts.append(account_id)
+            except:
+                dead_accounts.append(account_id)
+    
+    # إزالة الحسابات الميتة
+    for account_id in dead_accounts:
+        with connected_clients_lock:
+            if account_id in connected_clients:
+                del connected_clients[account_id]
+        print(f"⚠️ Account {account_id} disconnected - will restart")
+    
+    # إعادة تشغيل الحسابات الميتة
+    for account in ACCOUNTS:
+        if account['id'] in dead_accounts:
+            print(f"🔄 Restarting account: {account['id']}")
+            thread = threading.Thread(target=start_account, args=(account,))
+            thread.daemon = True
+            thread.start()
+            time.sleep(0.5)
+    
+    return len(dead_accounts)
+
+def continuous_restart_monitor():
+    """مراقبة مستمرة لإعادة تشغيل الحسابات"""
+    global last_restart_time
+    
+    while True:
+        try:
+            time.sleep(30)  # فحص كل 30 ثانية
+            
+            with connected_clients_lock:
+                total_connected = len(connected_clients)
+                total_accounts = len(ACCOUNTS)
+            
+            # إذا كانت جميع الحسابات متصلة، نعيد تشغيل بعضها للحفاظ على النشاط
+            if total_connected >= total_accounts * 0.8:  # 80% من الحسابات متصلة
+                print(f"\n📊 Status: {total_connected}/{total_accounts} accounts connected")
+                
+                # إعادة تشغيل عشوائي لبعض الحسابات
+                import random
+                accounts_list = list(connected_clients.keys())
+                if accounts_list:
+                    # إعادة تشغيل 5% من الحسابات كل دقيقة
+                    restart_count = max(1, int(len(accounts_list) * 0.05))
+                    to_restart = random.sample(accounts_list, min(restart_count, len(accounts_list)))
+                    
+                    for account_id in to_restart:
+                        print(f"🔄 Cycling account: {account_id}")
+                        with connected_clients_lock:
+                            if account_id in connected_clients:
+                                try:
+                                    old_client = connected_clients[account_id]
+                                    if hasattr(old_client, 'CliEnts2'):
+                                        old_client.CliEnts2.close()
+                                    if hasattr(old_client, 'CliEnts'):
+                                        old_client.CliEnts.close()
+                                except:
+                                    pass
+                                del connected_clients[account_id]
+                        
+                        # إعادة تشغيل الحساب
+                        for account in ACCOUNTS:
+                            if account['id'] == account_id:
+                                thread = threading.Thread(target=start_account, args=(account,))
+                                thread.daemon = True
+                                thread.start()
+                                break
+            
+            # فحص وإعادة تشغيل الحسابات الميتة
+            dead = check_and_restart_accounts()
+            if dead > 0:
+                print(f"🔄 Restarted {dead} dead accounts")
+                
+        except Exception as e:
+            print(f"Error in restart monitor: {e}")
+
+def restart_all_accounts():
+    """إعادة تشغيل جميع الحسابات"""
+    print("\n" + "=" * 50)
+    print("🔄 RESTARTING ALL ACCOUNTS...")
+    print("=" * 50)
+    
+    # إغلاق جميع الاتصالات الحالية
+    with connected_clients_lock:
+        for account_id, client in list(connected_clients.items()):
+            try:
+                if hasattr(client, 'CliEnts2'):
+                    client.CliEnts2.close()
+                if hasattr(client, 'CliEnts'):
+                    client.CliEnts.close()
+            except:
+                pass
+        connected_clients.clear()
+    
+    # إعادة تشغيل جميع الحسابات
+    start_all_accounts_background()
+    
+    print("✅ All accounts restarted")
+    print("=" * 50)
 
 # ============ دوال السبام ============
 def mark_account_busy_for_spam(account_id):
@@ -186,10 +310,23 @@ class FF_CLient():
             try:
                 self.DaTa = self.CliEnts.recv(1024)   
                 if len(self.DaTa) == 0:
+                    self.connection_active = False
                     break
                 time.sleep(0.1)
             except:
+                self.connection_active = False
                 break
+        
+        # إذا انقطع الاتصال، أعد تشغيل الحساب تلقائياً
+        if not self.connection_active:
+            print(f"⚠️ Account {self.id} disconnected, restarting...")
+            for account in ACCOUNTS:
+                if account['id'] == self.id:
+                    time.sleep(3)
+                    thread = threading.Thread(target=start_account, args=(account,))
+                    thread.daemon = True
+                    thread.start()
+                    break
                                     
     def GeT_Key_Iv(self, serialized_data):
         my_message = xKEys.MyMessage()
@@ -331,7 +468,7 @@ class FF_CLient():
             time.sleep(10)
             return self.Get_FiNal_ToKen_0115()
 
-# ============ تشغيل الحسابات في الخلفية ============
+# ============ تشغيل الحسابات ============
 def start_account(account):
     try:
         print(f"🚀 Starting account: {account['id']}")
@@ -340,27 +477,20 @@ def start_account(account):
         print(f"❌ Error starting account {account['id']}: {e}")
 
 def start_all_accounts_background():
-    """تشغيل الحسابات في الخلفية"""
+    """تشغيل جميع الحسابات في الخلفية"""
     print("\n" + "=" * 50)
-    print("🚀 Starting accounts in background...")
+    print("🚀 Starting all accounts...")
     print("=" * 50)
     
-    # تشغيل أول 100 حساب فقط للسرعة
-    for account in ACCOUNTS[:100]:
+    # تشغيل جميع الحسابات
+    for account in ACCOUNTS:
         thread = threading.Thread(target=start_account, args=(account,))
         thread.daemon = True
         thread.start()
-        time.sleep(0.3)
+        time.sleep(0.2)  # تأخير بسيط بين الحسابات
     
-    # استمر في تشغيل باقي الحسابات
-    def continue_accounts():
-        for account in ACCOUNTS[100:]:
-            thread = threading.Thread(target=start_account, args=(account,))
-            thread.daemon = True
-            thread.start()
-            time.sleep(0.3)
-    
-    threading.Thread(target=continue_accounts, daemon=True).start()
+    print(f"\n✅ Started {len(ACCOUNTS)} accounts")
+    print("=" * 50)
 
 # ============ API Endpoints ============
 
@@ -425,6 +555,12 @@ def stop_spam_short():
     
     return jsonify({'success': False, 'error': f'No active spam for {user_id}'}), 404
 
+@app.route('/spam/restart', methods=['GET'])
+def restart_accounts_api():
+    """إعادة تشغيل جميع الحسابات عبر API"""
+    threading.Thread(target=restart_all_accounts, daemon=True).start()
+    return jsonify({'success': True, 'message': 'Restarting all accounts...'}), 200
+
 @app.route('/spam/status', methods=['GET'])
 def status_api():
     """التحقق من حالة السبام"""
@@ -446,6 +582,7 @@ def accounts_api():
         return jsonify({
             'success': True, 
             'total': len(connected_clients), 
+            'total_accounts': len(ACCOUNTS),
             'accounts': list(connected_clients.keys())
         }), 200
 
@@ -453,7 +590,8 @@ def accounts_api():
 def home():
     """الصفحة الرئيسية"""
     with connected_clients_lock:
-        total_accounts = len(connected_clients)
+        total_connected = len(connected_clients)
+        total_accounts = len(ACCOUNTS)
     
     with active_spam_lock:
         active_spams = len(active_spam_targets)
@@ -462,12 +600,15 @@ def home():
         'name': 'Free Fire Spam API',
         'version': '1.0',
         'status': 'running',
-        'connected_accounts': total_accounts,
+        'connected_accounts': total_connected,
+        'total_accounts': total_accounts,
         'active_spams': active_spams,
+        'auto_restart': 'enabled',
         'endpoints': {
             'start_spam': '/spam?user_id={id}',
-            'stop_spam_long': '/spam/stop?user_id={id}',
+            'stop_spam': '/spam/stop?user_id={id}',
             'stop_spam_short': '/stop?user_id={id}',
+            'restart_accounts': '/spam/restart',
             'check_status': '/spam/status?user_id={id}',
             'accounts': '/spam/accounts'
         }
@@ -476,24 +617,30 @@ def home():
 # ============ Main ============
 if __name__ == '__main__':
     print("\n" + "=" * 60)
-    print("🔥 FREE FIRE SPAM API SERVER")
+    print("🔥 FREE FIRE SPAM API SERVER (Auto-Restart Enabled)")
     print("=" * 60)
     
     # تحميل الحسابات
     ACCOUNTS = load_accounts_from_file()
     
     if ACCOUNTS:
-        # تشغيل الحسابات في الخلفية
-        accounts_thread = threading.Thread(target=start_all_accounts_background, daemon=True)
-        accounts_thread.start()
+        # تشغيل الحسابات
+        start_all_accounts_background()
+        
+        # تشغيل مراقبة إعادة التشغيل التلقائية
+        monitor_thread = threading.Thread(target=continuous_restart_monitor, daemon=True)
+        monitor_thread.start()
+        print("✅ Auto-restart monitor started")
     else:
         print("❌ No accounts found in accs.json")
     
     print("\n" + "=" * 60)
     print("🌐 STARTING FLASK SERVER...")
     print("=" * 60)
-    print("\n✅ Accounts will connect in the background")
+    print("\n✅ Accounts will connect in background")
+    print("✅ Auto-restart: Accounts will restart automatically")
     print("✅ API is ready to use\n")
     
     # تشغيل Flask
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
