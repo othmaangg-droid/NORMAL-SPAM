@@ -3,5 +3,6 @@ requests
 pyjwt
 pycryptodome
 protobuf
+protobuf_decoder
 urllib3
 psutil
